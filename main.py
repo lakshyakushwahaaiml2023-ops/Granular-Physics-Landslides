@@ -14,51 +14,13 @@ from torch.utils.data import DataLoader, random_split
 from core.particles import ParticleState
 from core.terrain import concave_slope, Terrain
 from core.dem_solver import DEMSolver
-from models.unet2d import UNet2D
+from models.unet2d import UNet2D, RunoutPredictor, GranularPhysicsLoss
 from data.generator import LandslideGenerator, LandslideDataset, grid_to_visualization, particles_to_grid
 from utils.metrics import runout_distance, deposit_centroid, max_deposit_height, flow_front_velocity, mobility_ratio
 
 # Set random seed for reproducibility
 np.random.seed(42)
 torch.manual_seed(42)
-
-
-class RunoutPredictor(nn.Module):
-    """
-    CNN model to predict final runout distance (scalar) from initial grid state.
-    Input: (B, 5, 64, 128)
-    Output: (B,)
-    """
-    def __init__(self):
-        super().__init__()
-        self.features = nn.Sequential(
-            nn.Conv2d(5, 16, kernel_size=3, stride=2, padding=1),  # (16, 32, 64)
-            nn.BatchNorm2d(16),
-            nn.ReLU(inplace=True),
-            
-            nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1), # (32, 16, 32)
-            nn.BatchNorm2d(32),
-            nn.ReLU(inplace=True),
-            
-            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1), # (64, 8, 16)
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
-            
-            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),# (128, 4, 8)
-            nn.BatchNorm2d(128),
-            nn.ReLU(inplace=True),
-            
-            nn.AdaptiveAvgPool2d((1, 1)),
-            nn.Flatten()
-        )
-        self.fc = nn.Sequential(
-            nn.Linear(128, 64),
-            nn.ReLU(inplace=True),
-            nn.Linear(64, 1)
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.fc(self.features(x)).squeeze(-1)
 
 
 def train_next_state(train_path: str, val_path: str, epochs=10, batch_size=32, lr=1e-3, device='cpu'):
@@ -72,9 +34,9 @@ def train_next_state(train_path: str, val_path: str, epochs=10, batch_size=32, l
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
     
-    model = UNet2D(in_channels=5, out_channels=4).to(device)
+    model = UNet2D().to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    criterion = nn.MSELoss()
+    criterion = GranularPhysicsLoss()
     
     train_losses = []
     val_losses = []
@@ -87,7 +49,8 @@ def train_next_state(train_path: str, val_path: str, epochs=10, batch_size=32, l
             
             optimizer.zero_grad()
             pred = model(batch_x)
-            loss = criterion(pred, batch_y)
+            losses = criterion(pred, batch_y, batch_x)
+            loss = losses['total']
             loss.backward()
             optimizer.step()
             
@@ -103,7 +66,8 @@ def train_next_state(train_path: str, val_path: str, epochs=10, batch_size=32, l
             for batch_x, batch_y in val_loader:
                 batch_x, batch_y = batch_x.to(device), batch_y.to(device)
                 pred = model(batch_x)
-                loss = criterion(pred, batch_y)
+                losses = criterion(pred, batch_y, batch_x)
+                loss = losses['total']
                 epoch_val_loss += loss.item() * batch_x.size(0)
         epoch_val_loss /= len(val_dataset)
         val_losses.append(epoch_val_loss)
@@ -126,7 +90,7 @@ def train_runout_predictor(train_path: str, val_path: str, epochs=10, batch_size
     
     model = RunoutPredictor().to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    criterion = nn.MSELoss()
+    criterion = nn.HuberLoss()
     
     train_losses = []
     val_losses = []
@@ -160,7 +124,7 @@ def train_runout_predictor(train_path: str, val_path: str, epochs=10, batch_size
         epoch_val_loss /= len(val_dataset)
         val_losses.append(epoch_val_loss)
         
-        print(f"Epoch {epoch}/{epochs} | Train Loss: {epoch_loss:.4f} m^2 | Val Loss: {epoch_val_loss:.4f} m^2")
+        print(f"Epoch {epoch}/{epochs} | Train Loss: {epoch_loss:.4f} | Val Loss: {epoch_val_loss:.4f}")
         
     return model, train_losses, val_losses, val_dataset
 

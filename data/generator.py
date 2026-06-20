@@ -16,7 +16,7 @@ from utils.metrics import runout_distance
 def compute_terrain_occupancy_jit(terrain_points, H, W, domain_x, domain_y):
     """
     JIT-compiled terrain occupancy grid computation.
-    Evaluates signed distance to polyline for each grid cell.
+    Evaluates signed distance to polyline for each grid cell center.
     """
     occupancy = np.zeros((H, W), dtype=np.float32)
     dx = (domain_x[1] - domain_x[0]) / W
@@ -95,6 +95,7 @@ def particles_to_grid_jit(pos, vel, radius, mass, active, domain_x, domain_y, H,
         m = mass[i]
         ke = 0.5 * m * (vx*vx + vy*vy)
         
+        # Grid index coordinates relative to cell centers
         c_float = (px - domain_x[0]) / dx - 0.5
         r_float = (py - domain_y[0]) / dy - 0.5
         
@@ -194,7 +195,7 @@ class LandslideGenerator:
         self.domain_x = (0.0, 4.0)
         self.domain_y = (0.0, 3.0)
 
-    def generate_trajectory(self, state0: ParticleState, terrain: Terrain, n_steps=3000, pile_x=0.5) -> dict:
+    def generate_trajectory(self, state0: ParticleState, terrain: Terrain, n_steps=3000, pile_x=0.5, slope_angle=0.0) -> dict:
         """
         Runs DEM for n_steps, saving inputs (5, H, W) and targets (4, H, W) every `skip` steps.
         """
@@ -235,6 +236,7 @@ class LandslideGenerator:
             'targets': targets,
             'terrain': terrain_occupancy,
             'metadata': {
+                'slope_angle': slope_angle,
                 'N_particles': state0.N,
                 'final_runout': final_runout
             }
@@ -250,9 +252,13 @@ class LandslideGenerator:
         targets_list = []
         runout_distances = []
         
-        slope_angles = []
-        n_particles = []
-        final_runouts = []
+        # Structured NumPy array definition for metadata
+        metadata_dtype = np.dtype([
+            ('slope_angle', 'f4'),
+            ('N_particles', 'i4'),
+            ('final_runout', 'f4')
+        ])
+        metadata_arr = np.zeros(n_trajectories, dtype=metadata_dtype)
         
         print(f"Generating {n_trajectories} trajectories into {save_path}...")
         for t_idx in tqdm(range(n_trajectories)):
@@ -280,18 +286,20 @@ class LandslideGenerator:
             )
             
             # Run simulation
-            traj = self.generate_trajectory(state0, terrain, n_steps=3000, pile_x=pile_x)
+            traj = self.generate_trajectory(state0, terrain, n_steps=3000, pile_x=pile_x, slope_angle=slope_angle)
             
             inputs_list.append(traj['inputs'])
             targets_list.append(traj['targets'])
             runout_distances.append(traj['metadata']['final_runout'])
             
-            slope_angles.append(slope_angle)
-            n_particles.append(state0.N)
-            final_runouts.append(traj['metadata']['final_runout'])
+            metadata_arr[t_idx] = (
+                traj['metadata']['slope_angle'],
+                traj['metadata']['N_particles'],
+                traj['metadata']['final_runout']
+            )
             
         # Combine
-        X = np.concatenate(inputs_list, axis=0) # (n_traj * frames, 5, H, W)
+        X = np.concatenate(inputs_list, axis=0)  # (n_traj * frames, 5, H, W)
         Y = np.concatenate(targets_list, axis=0) # (n_traj * frames, 4, H, W)
         runout_distances = np.array(runout_distances, dtype=np.float32)
         
@@ -299,13 +307,8 @@ class LandslideGenerator:
         with h5py.File(save_path, 'w') as f:
             f.create_dataset('inputs', data=X, compression='gzip')
             f.create_dataset('targets', data=Y, compression='gzip')
+            f.create_dataset('metadata', data=metadata_arr)
             f.create_dataset('runout_distances', data=runout_distances, compression='gzip')
-            
-            # Metadata group
-            meta = f.create_group('metadata')
-            meta.create_dataset('slope_angles', data=np.array(slope_angles, dtype=np.float32))
-            meta.create_dataset('n_particles', data=np.array(n_particles, dtype=np.int32))
-            meta.create_dataset('final_runouts', data=np.array(final_runouts, dtype=np.float32))
             
         print(f"Saved dataset: {save_path}")
 
@@ -313,10 +316,13 @@ class LandslideGenerator:
 class LandslideDataset(torch.utils.data.Dataset):
     """
     Standard PyTorch Dataset for landslide state grids or runout distance targets.
+    Supports memory preloading or lazy-loaded HDF5 file caching to optimize training speed.
     """
-    def __init__(self, h5_path: str, mode='next_state'):
+    def __init__(self, h5_path: str, mode='next_state', preload=False):
         self.h5_path = h5_path
         self.mode = mode
+        self.preload = preload
+        self.f = None
         
         if not os.path.exists(h5_path):
             raise FileNotFoundError(f"Dataset file not found at {h5_path}")
@@ -326,22 +332,53 @@ class LandslideDataset(torch.utils.data.Dataset):
             self.num_traj = len(f['runout_distances'])
             self.frames_per_traj = self.total_frames // self.num_traj
 
+        if self.preload:
+            print(f"[LandslideDataset] Preloading {h5_path} into RAM...", flush=True)
+            with h5py.File(self.h5_path, 'r') as f:
+                self.inputs_mem = f['inputs'][:]
+                self.targets_mem = f['targets'][:]
+                self.runout_distances_mem = f['runout_distances'][:]
+            print(f"[LandslideDataset] Preload complete.", flush=True)
+
     def __len__(self):
         if self.mode == 'runout':
             return self.num_traj
         return self.total_frames
 
     def __getitem__(self, idx):
-        with h5py.File(self.h5_path, 'r') as f:
+        if self.preload:
             if self.mode == 'runout':
                 frame_idx = idx * self.frames_per_traj
-                inp = torch.from_numpy(f['inputs'][frame_idx]).float()
-                target = torch.tensor(f['runout_distances'][idx]).float()
+                inp = torch.from_numpy(self.inputs_mem[frame_idx]).float()
+                target = torch.tensor(self.runout_distances_mem[idx]).float()
                 return inp, target
             else:
-                inp = torch.from_numpy(f['inputs'][idx]).float()
-                target = torch.from_numpy(f['targets'][idx]).float()
+                inp = torch.from_numpy(self.inputs_mem[idx]).float()
+                target = torch.from_numpy(self.targets_mem[idx]).float()
                 return inp, target
+        else:
+            # Lazy load: Open HDF5 file handle once per worker process
+            if self.f is None:
+                self.f = h5py.File(self.h5_path, 'r')
+                
+            if self.mode == 'runout':
+                frame_idx = idx * self.frames_per_traj
+                inp = torch.from_numpy(self.f['inputs'][frame_idx]).float()
+                target = torch.tensor(self.f['runout_distances'][idx]).float()
+                return inp, target
+            else:
+                inp = torch.from_numpy(self.f['inputs'][idx]).float()
+                target = torch.from_numpy(self.f['targets'][idx]).float()
+                return inp, target
+
+    def close(self):
+        """Explicitly close HDF5 file handle if open."""
+        if self.f is not None:
+            try:
+                self.f.close()
+            except Exception:
+                pass
+            self.f = None
 
 
 if __name__ == '__main__':
